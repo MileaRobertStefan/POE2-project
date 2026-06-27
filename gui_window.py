@@ -15,7 +15,7 @@ from PyQt6.QtWidgets import (
     QSizePolicy, QLineEdit, QComboBox, QToolButton,
 )
 
-from gui_mod_builder import ModBuilderDialog
+from gui_mod_builder import ModBuilderDialog, _load_all_db_groups
 from gui_worker import ScanWorker, CraftWorker
 from gui_settings import SettingsTab, load_settings
 from crafting.targets import (
@@ -107,6 +107,37 @@ def _find_tier_options(slug: str, family: str, section_key: str | None = None) -
         else groups_by_section.values()
     )
     for groups in sections:
+        for g in groups:
+            if g.get("family") == family:
+                tiers = g.get("tiers", [])
+                return sorted(tiers, key=lambda t: t.get("tier", 0))
+    return None
+
+
+def _read_active_source() -> str | None:
+    """Return the filename of the saved target that was last used to set the
+    active target, or None if unknown (e.g. never set since this feature shipped)."""
+    if ACTIVE_SOURCE_FILE.exists():
+        try:
+            name = ACTIVE_SOURCE_FILE.read_text(encoding="utf-8").strip()
+            return name or None
+        except Exception:
+            return None
+    return None
+
+
+def _mode_display(mode: str) -> str:
+    if mode == "search":
+        return "search (matches any of the listed mods)"
+    if mode == "target":
+        return "target (strict — exactly 3 prefixes + 3 suffixes)"
+    return mode
+
+
+def _find_tier_options(slug: str, family: str) -> list[dict] | None:
+    """Look up the real tier list for a mod family from its slug's DB file."""
+    groups_by_section = _load_all_db_groups(slug)
+    for groups in groups_by_section.values():
         for g in groups:
             if g.get("family") == family:
                 tiers = g.get("tiers", [])
@@ -288,29 +319,13 @@ class TargetsTab(QWidget):
         header_row.addWidget(self._btn_new)
         left.addLayout(header_row)
 
-        expand_row = QHBoxLayout()
-        expand_row.addStretch()
-        self._btn_expand_all = QPushButton("Expand All")
-        self._btn_collapse_all = QPushButton("Collapse All")
-        for btn in (self._btn_expand_all, self._btn_collapse_all):
-            btn.setFixedHeight(20)
-            expand_row.addWidget(btn)
-        left.addLayout(expand_row)
-
-        self._category_filter = QComboBox()
-        self._category_filter.addItem("All Categories", userData=None)
-        left.addWidget(self._category_filter)
-
         self._filter_edit = QLineEdit()
         self._filter_edit.setPlaceholderText("Filter by name or item type...")
         left.addWidget(self._filter_edit)
 
-        self._save_tree = QTreeWidget()
-        self._save_tree.setHeaderHidden(True)
-        self._save_tree.setColumnCount(1)
-        self._save_tree.setAlternatingRowColors(True)
-        self._tree_ever_populated = False
-        left.addWidget(self._save_tree, 1)
+        self._save_list = QListWidget()
+        self._save_list.setAlternatingRowColors(True)
+        left.addWidget(self._save_list, 1)
 
         left_widget = QWidget()
         left_widget.setLayout(left)
@@ -399,11 +414,7 @@ class TargetsTab(QWidget):
 
         # Connections
         self._filter_edit.textChanged.connect(self._apply_filter)
-        self._category_filter.currentIndexChanged.connect(self._apply_filter)
-        self._save_tree.currentItemChanged.connect(self._on_selection_changed)
-        self._save_tree.itemClicked.connect(self._on_item_clicked)
-        self._btn_expand_all.clicked.connect(self._save_tree.expandAll)
-        self._btn_collapse_all.clicked.connect(self._save_tree.collapseAll)
+        self._save_list.currentItemChanged.connect(self._on_selection_changed)
         self._btn_new.clicked.connect(self._on_new)
         self._btn_edit.clicked.connect(self._on_edit)
         self._btn_dup.clicked.connect(self._on_duplicate)
@@ -424,30 +435,14 @@ class TargetsTab(QWidget):
         self._update_active_status(self._selected_path())
 
     def _refresh_list(self) -> None:
-        expanded_state: dict[tuple[str, str], bool] = {}
-
-        def snapshot(item: QTreeWidgetItem) -> None:
-            kind = item.data(0, self._ROLE_KIND)
-            if kind != "leaf":
-                expanded_state[(kind, item.data(0, self._ROLE_KEY))] = item.isExpanded()
-            for i in range(item.childCount()):
-                snapshot(item.child(i))
-
-        for i in range(self._save_tree.topLevelItemCount()):
-            snapshot(self._save_tree.topLevelItem(i))
-
-        selected_key: tuple[str, str] | None = None
-        cur = self._save_tree.currentItem()
-        if cur is not None:
-            kind = cur.data(0, self._ROLE_KIND)
-            if kind == "leaf":
-                selected_key = ("leaf", cur.data(0, Qt.ItemDataRole.UserRole).name)
-            else:
-                selected_key = (kind, cur.data(0, self._ROLE_KEY))
+        current_name = None
+        cur = self._save_list.currentItem()
+        if cur:
+            current_name = cur.data(Qt.ItemDataRole.UserRole).name
 
         active_source = _read_active_source()
 
-        self._save_tree.clear()
+        self._save_list.clear()
         SAVES_DIR.mkdir(exist_ok=True)
         paths = sorted(SAVES_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
 
@@ -455,6 +450,20 @@ class TargetsTab(QWidget):
         for path in paths:
             try:
                 data = json.loads(path.read_text(encoding="utf-8"))
+                slug = data.get("slug", "?")
+                mode = data.get("mode", "?")
+                mods = _mods_from_data(data)
+                label = f"{data.get('save_name', path.stem)}  ({slug}, {len(mods)} mods)"
+                item = QListWidgetItem(label)
+                item.setData(Qt.ItemDataRole.UserRole, path)
+                if active_source is not None and path.name == active_source:
+                    font = item.font()
+                    font.setBold(True)
+                    item.setFont(font)
+                    item.setForeground(QColor("#b8943f"))
+                self._save_list.addItem(item)
+                if current_name and path.name == current_name:
+                    self._save_list.setCurrentItem(item)
             except Exception:
                 continue
             slug = data.get("slug", "?")
@@ -587,6 +596,25 @@ class TargetsTab(QWidget):
             self._btn_set_active.setEnabled(False)
             return
 
+        if self._save_list.currentRow() < 0 and self._save_list.count() > 0:
+            self._save_list.setCurrentRow(0)
+
+        self._apply_filter(self._filter_edit.text())
+
+    def _apply_filter(self, text: str) -> None:
+        text = text.strip().lower()
+        for i in range(self._save_list.count()):
+            item = self._save_list.item(i)
+            item.setHidden(bool(text) and text not in item.text().lower())
+
+    def _update_active_status(self, path: Path | None) -> None:
+        """Reflect whether the selected target is the active one, and toggle Set Active."""
+        if path is None:
+            self._lbl_active.setText("No target selected")
+            self._lbl_active.setStyleSheet("font-size: 13px; font-weight: bold; color: #999;")
+            self._btn_set_active.setEnabled(False)
+            return
+
         active_source = _read_active_source()
         if active_source is not None and path.name == active_source:
             self._lbl_active.setText("● Active")
@@ -597,12 +625,8 @@ class TargetsTab(QWidget):
             self._lbl_active.setStyleSheet("font-size: 13px; font-weight: bold; color: #999;")
             self._btn_set_active.setEnabled(True)
 
-    def _on_selection_changed(
-        self, current: QTreeWidgetItem | None, previous: QTreeWidgetItem | None = None
-    ) -> None:
-        if current is None or current.data(0, self._ROLE_KIND) != "leaf":
-            self._current_path = None
-            self._clear_detail_panel()
+    def _on_selection_changed(self, item: QListWidgetItem | None) -> None:
+        if item is None:
             self._update_active_status(None)
             return
         path: Path = current.data(0, Qt.ItemDataRole.UserRole)
@@ -613,18 +637,6 @@ class TargetsTab(QWidget):
             self._update_active_status(path)
         except Exception as exc:
             QMessageBox.warning(self, "Load Error", str(exc))
-
-    def _on_item_clicked(self, item: QTreeWidgetItem, column: int) -> None:
-        if item.data(0, self._ROLE_KIND) != "leaf":
-            item.setExpanded(not item.isExpanded())
-
-    def _clear_detail_panel(self) -> None:
-        self._lbl_meta.setText("")
-        self._lbl_edit_note.setVisible(False)
-        self._mod_table.setRowCount(0)
-        self._mod_row_refs = []
-        self._fifty_table.setRowCount(0)
-        self._fifty_row_refs = []
 
     def _populate_detail(self, data: dict, path: Path) -> None:
         slug = data.get("slug", "?")
@@ -671,7 +683,7 @@ class TargetsTab(QWidget):
         family_item.setToolTip(family)
         table.setItem(row, 1, family_item)
 
-        tier_options = _find_tier_options(slug, family, entry.get("section_key"))
+        tier_options = _find_tier_options(slug, family)
         if tier_options:
             combo = QComboBox()
             current_tier = entry.get("min_tier")
@@ -710,10 +722,9 @@ class TargetsTab(QWidget):
     def _note_if_active(self, data: dict) -> None:
         active_source = _read_active_source()
         if self._current_path is not None and active_source == self._current_path.name:
-            if target_to_active(data) != self._main.active_target_data:
-                self._lbl_edit_note.setText("Edited — click Set Active to apply this change")
-                self._lbl_edit_note.setVisible(True)
-                return
+            self._lbl_edit_note.setText("Edited — click Set Active to apply this change")
+            self._lbl_edit_note.setVisible(True)
+            return
         self._lbl_edit_note.setVisible(False)
 
     def _on_tier_changed(self, list_key: str, index: int, combo: QComboBox) -> None:
